@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.pth
+*.json
+*.txt
+!README.md
+.ipynb_checkpoints/
+.DS_Store
