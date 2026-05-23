@@ -1,269 +1,220 @@
-"""
-evaluate.py
------------
-Evaluation utilities: metrics, confusion matrices, qualitative visualisation,
-and a full evaluation pipeline.
-
-Usage
------
-    from galaxeye.evaluate import run_evaluation
-
-    results = run_evaluation(
-        checkpoint_path='best.pth',
-        val_loader=val_loader,
-        test_loader=test_loader,
-        output_dir='/results',
-        threshold=0.4,
-    )
-"""
-
+import torch
+import numpy as np
 import os
 import json
-import numpy as np
-import torch
-import matplotlib
-matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.metrics import ConfusionMatrixDisplay, confusion_matrix
+import rasterio
 import warnings
 from rasterio.errors import NotGeoreferencedWarning
 
 from .config import CONFIG
-from .model  import load_model_from_checkpoint, compute_metrics
+from .model  import (get_model, combined_loss,
+                     compute_metrics, compute_confusion_matrix)
 
 warnings.filterwarnings('ignore', category=NotGeoreferencedWarning)
 
-device = torch.device(CONFIG['device'])
-_amp_dtype = torch.bfloat16 if CONFIG.get('use_bf16') else torch.float16
+device     = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+_amp_dtype = torch.bfloat16 if CONFIG['use_bf16'] else torch.float16
 
 
-# ── Inference on a split ───────────────────────────────────────────────────
-
-def predict_split(model, loader, threshold: float = None) -> tuple:
-    """
-    Run inference over a DataLoader and collect predictions + targets.
-
-    Args:
-        model:     Trained model (eval mode).
-        loader:    DataLoader for the split.
-        threshold: Binarisation threshold.
-
-    Returns:
-        (all_preds, all_targets) — numpy arrays (N, 1, H, W).
-    """
-    thr = threshold if threshold is not None else CONFIG['threshold']
-    model.eval()
-    preds_list, tgts_list = [], []
-
-    with torch.no_grad():
-        for i, (images, masks) in enumerate(loader):
-            images = images.to(device, non_blocking=True)
-            with torch.amp.autocast(device_type='cuda', dtype=_amp_dtype):
-                logits = model(images)
-            preds_list.append(torch.sigmoid(logits).float().cpu().numpy())
-            tgts_list.append(masks.numpy())
-            if i % 10 == 0:
-                print(f"  batch {i}/{len(loader)}", end='\r')
-
-    print()
-    return np.concatenate(preds_list), np.concatenate(tgts_list)
-
-
-# ── Confusion matrix ───────────────────────────────────────────────────────
-
-def plot_confusion_matrix(
-    all_preds: np.ndarray,
-    all_targets: np.ndarray,
-    threshold: float,
-    split_name: str,
-    output_dir: str,
-) -> None:
-    """Plot, print, and save a confusion matrix for the given split."""
-    preds = (all_preds > threshold).astype(int).flatten()
-    tgts  = all_targets.astype(int).flatten()
-    cm    = confusion_matrix(tgts, preds)
-
+def plot_test_confusion_matrix(cm, run_name, save_dir):
+    """Plot and save a labelled confusion-matrix heatmap for test results."""
+    TN, FP, FN, TP = cm.ravel()
+    labels = [
+        [f'TN\n{TN:,}', f'FP\n{FP:,}'],
+        [f'FN\n{FN:,}', f'TP\n{TP:,}'],
+    ]
     fig, ax = plt.subplots(figsize=(6, 5))
-    ConfusionMatrixDisplay(cm, display_labels=['No-Change', 'Change']).plot(
-        ax=ax, cmap='Blues', colorbar=False)
-    ax.set_title(f'Confusion Matrix — {split_name}', fontsize=13, fontweight='bold')
+    sns.heatmap(
+        cm, annot=labels, fmt='', cmap='Blues', linewidths=.5,
+        xticklabels=['No Change', 'Change'],
+        yticklabels=['No Change', 'Change'],
+        ax=ax,
+    )
+    ax.set_xlabel('Predicted', fontsize=12)
+    ax.set_ylabel('True',      fontsize=12)
+    ax.set_title(f'Test Confusion Matrix for {run_name}', fontsize=13)
     plt.tight_layout()
-
-    path = os.path.join(output_dir, f'confusion_matrix_{split_name}.png')
-    plt.savefig(path, dpi=100, bbox_inches='tight')
+    plt.savefig(os.path.join(save_dir, f'test_cm_{run_name}.png'), dpi=120)
+    plt.show()
     plt.close()
-    print(f"[eval] Saved confusion matrix → {path}")
-
-    tn, fp, fn, tp = cm.ravel()
-    print(f"  TN={tn:,}  FP={fp:,}  FN={fn:,}  TP={tp:,}")
+    print(f"  CM  TN={TN:,}  FP={FP:,}  FN={FN:,}  TP={TP:,}")
 
 
-# ── Qualitative visualisation ──────────────────────────────────────────────
-
-def visualize_predictions(
-    model,
-    loader,
-    split_name: str,
-    threshold: float,
-    output_dir: str,
-    n_success: int = 3,
-    n_failure: int = 2,
-) -> None:
-    """
-    Plot a 5-row grid of EO / SAR / ground-truth / prediction quads,
-    mixing high-IoU successes and low-IoU failures.
-    """
+def test_model(model, loader):
     model.eval()
-    successes, failures = [], []
+    total_loss = 0.0
+    all_preds, all_targets = [], []
 
     with torch.no_grad():
         for images, masks in loader:
-            imgs_gpu = images.to(device)
+            images = images.to(device, non_blocking=True,
+                               memory_format=torch.channels_last)
+            masks  = masks.to(device, non_blocking=True)
+
             with torch.amp.autocast(device_type='cuda', dtype=_amp_dtype):
-                preds = torch.sigmoid(model(imgs_gpu))
+                preds = model(images)
+                loss  = combined_loss(preds, masks, 0)  # epoch=0 for test
 
-            preds_np  = preds.cpu().numpy()
-            masks_np  = masks.numpy()
-            images_np = images.numpy()
+            total_loss += loss.item()
+            all_preds.append(torch.sigmoid(preds).float().cpu().numpy())
+            all_targets.append(masks.float().cpu().numpy())
 
-            for i in range(len(images_np)):
-                pb  = (preds_np[i, 0] > threshold).astype(int)
-                tgt = masks_np[i, 0].astype(int)
-                if tgt.sum() == 0:
-                    continue
+    all_preds   = np.concatenate(all_preds)
+    all_targets = np.concatenate(all_targets)
 
-                inter = ((pb == 1) & (tgt == 1)).sum()
-                union = ((pb == 1) | (tgt == 1)).sum()
-                iou   = inter / (union + 1e-6)
+    metrics = compute_metrics(all_preds, all_targets, CONFIG['threshold'])
+    cm      = compute_confusion_matrix(all_preds, all_targets,
+                                       CONFIG['threshold'])
+    return total_loss / len(loader), metrics, cm
 
-                sample = {'image': images_np[i], 'pred': preds_np[i, 0],
-                          'pred_bin': pb, 'target': tgt, 'iou': iou}
-                (successes if iou > 0.3 else failures).append(sample)
 
-            if len(successes) >= n_success and len(failures) >= n_failure:
+def visualize_predictions(model, dataset, num_samples=5):
+    model.eval()
+    samples_processed = 0
+
+    with torch.no_grad():
+        for idx in range(len(dataset)):
+            if samples_processed >= num_samples:
                 break
 
-    selected = successes[:n_success] + failures[:n_failure]
-    labels   = ['Success'] * n_success + ['Failure'] * n_failure
-    n_rows   = len(selected)
+            fname = dataset.filenames[idx]
 
-    fig, axes = plt.subplots(n_rows, 4, figsize=(18, 5 * n_rows))
-    if n_rows == 1:
-        axes = axes[np.newaxis]
+            with rasterio.open(os.path.join(dataset.root_dir, dataset.split,
+                                            'pre-event', fname)) as src:
+                original_eo = src.read().astype(np.float32) / 255.0
+            original_eo_display = original_eo.transpose(1, 2, 0)[:, :, :3]
 
-    for ax, title in zip(axes[0], ['EO (pre)', 'SAR (post)', 'Ground Truth', 'Prediction']):
-        ax.set_title(title, fontsize=12, fontweight='bold')
+            with rasterio.open(os.path.join(dataset.root_dir, dataset.split,
+                                            'post-event', fname)) as src:
+                original_sar = src.read(1).astype(np.float32) / 255.0
+            original_sar_display = original_sar
 
-    for i, (s, lbl) in enumerate(zip(selected, labels)):
-        img = s['image']
-        eo  = img[:3].transpose(1, 2, 0)
-        eo  = (eo - eo.min()) / (eo.max() - eo.min() + 1e-6)
-        sar = img[3]
-        sar = (sar - sar.min()) / (sar.max() - sar.min() + 1e-6)
+            transformed_image_tensor, true_mask_tensor = dataset[idx]
 
-        axes[i, 0].imshow(eo)
-        axes[i, 1].imshow(sar, cmap='gray')
-        axes[i, 2].imshow(s['target'],   cmap='Reds', vmin=0, vmax=1)
-        axes[i, 3].imshow(s['pred_bin'], cmap='Reds', vmin=0, vmax=1)
+            input_image_batch = transformed_image_tensor.unsqueeze(0).to(
+                device, non_blocking=True,
+                memory_format=torch.channels_last)
 
-        colour = 'green' if lbl == 'Success' else 'red'
-        axes[i, 0].set_ylabel(f'[{lbl}]\nIoU={s["iou"]:.3f}',
-                               fontsize=10, color=colour, fontweight='bold')
-        for ax in axes[i]:
-            ax.axis('off')
+            preds        = model(input_image_batch)
+            preds_binary = (torch.sigmoid(preds) > CONFIG['threshold']).float()
 
-    plt.suptitle(f'Qualitative Results — {split_name}',
-                 fontsize=14, fontweight='bold', y=1.01)
-    plt.tight_layout()
+            input_image_for_display = transformed_image_tensor.cpu().numpy().transpose(1, 2, 0)
+            true_mask  = true_mask_tensor.cpu().numpy().squeeze()
+            pred_mask  = preds_binary[0].cpu().numpy().squeeze()
 
-    path = os.path.join(output_dir, f'predictions_{split_name}.png')
-    plt.savefig(path, dpi=100, bbox_inches='tight')
-    plt.close()
-    print(f"[eval] Saved qualitative plot → {path}")
+            processed_input_display = np.clip(input_image_for_display[:, :, :3], 0, 1)
+
+            fig, axes = plt.subplots(1, 5, figsize=(25, 6))
+
+            axes[0].imshow(original_eo_display)
+            axes[0].set_title('Original EO (Pre-event)')
+            axes[0].axis('off')
+
+            axes[1].imshow(original_sar_display, cmap='gray')
+            axes[1].set_title('Original SAR (Post-event)')
+            axes[1].axis('off')
+
+            axes[2].imshow(processed_input_display)
+            axes[2].set_title('Model Input (Processed EO)')
+            axes[2].axis('off')
+
+            axes[3].imshow(true_mask, cmap='gray')
+            axes[3].set_title('Ground Truth Mask')
+            axes[3].axis('off')
+
+            axes[4].imshow(pred_mask, cmap='gray')
+            axes[4].set_title(f"Predicted Mask (Thresh={CONFIG['threshold']})")
+            axes[4].axis('off')
+
+            plt.tight_layout()
+            plt.show()
+
+            samples_processed += 1
 
 
-# ── Results table ──────────────────────────────────────────────────────────
-
-def print_results_table(val_metrics: dict, test_metrics: dict) -> None:
-    print("\n" + "=" * 55)
-    print(f"{'Metric':<15} {'Validation':>15} {'Test':>15}")
-    print("=" * 55)
-    for key in ['f1', 'iou', 'precision', 'recall']:
-        print(f"{key.upper():<15} "
-              f"{val_metrics[key]:>15.4f} "
-              f"{test_metrics[key]:>15.4f}")
-    print("=" * 55)
-
-
-# ── Full evaluation pipeline ───────────────────────────────────────────────
-
-def run_evaluation(
-    val_loader,
-    test_loader,
-    checkpoint_path: str = None,
-    threshold: float = None,
-    output_dir: str = None,
-    model=None,
-) -> dict:
+def evaluate_all_runs(runs, dataset_root, test_loader, test_dataset,
+                      norm_stats):
     """
-    Load the best model and evaluate on val and test splits.
+    Evaluate multiple checkpoint runs on the test set — exact logic from
+    the training notebook's multi-run evaluation cell.
 
     Args:
-        val_loader:       Validation DataLoader.
-        test_loader:      Test DataLoader.
-        checkpoint_path:  Path to best.pth (default: CONFIG checkpoint_dir/best.pth).
-        threshold:        Binarisation threshold (default: CONFIG threshold).
-        output_dir:       Where to save plots and results.json.
-        model:            If provided, skip loading from checkpoint.
-
-    Returns:
-        dict with 'validation' and 'test' metrics.
+        runs:          List of checkpoint folder names under dataset_root.
+        dataset_root:  Root where checkpoint folders live.
+        test_loader:   DataLoader for test split.
+        test_dataset:  ChangeDetectionDataset for test split.
+        norm_stats:    Normalisation stats dict.
     """
-    thr      = threshold  if threshold  is not None else CONFIG['threshold']
-    out_dir  = output_dir if output_dir is not None else CONFIG['output_dir']
-    os.makedirs(out_dir, exist_ok=True)
+    from torch.utils.data import DataLoader
+    from .dataset import ChangeDetectionDataset, _loader_kw
 
-    if model is None:
-        ckpt_path = checkpoint_path or os.path.join(
-            CONFIG['checkpoint_dir'], 'best.pth')
-        model, _ = load_model_from_checkpoint(ckpt_path)
+    for i in runs:
+        ckpt = torch.load(
+            os.path.join(dataset_root, i, 'best.pth'),
+            map_location=device)
 
-    print(f"\n[eval] Threshold = {thr}")
+        original_encoder    = CONFIG['encoder']
+        original_image_size = CONFIG['image_size']
+        original_batch_size = CONFIG['batch_size']
 
-    # ── Validation ──────────────────────────────────────────────────────────
-    print("[eval] Evaluating val split…")
-    val_preds, val_tgts = predict_split(model, val_loader, thr)
-    val_metrics         = compute_metrics(val_preds, val_tgts, thr)
-    print(f"  F1={val_metrics['f1']:.4f}  IoU={val_metrics['iou']:.4f}  "
-          f"Prec={val_metrics['precision']:.4f}  Rec={val_metrics['recall']:.4f}")
+        if 'config' in ckpt:
+            CONFIG.update(ckpt['config'])
+        else:
+            if 'efficientnet' in i:
+                CONFIG['encoder']     = 'efficientnet-b0'
+                CONFIG['image_size']  = 512
+            elif 'resnet50' in i:
+                CONFIG['encoder']     = 'resnet50'
+                CONFIG['image_size']  = 1024
 
-    # ── Test ────────────────────────────────────────────────────────────────
-    print("[eval] Evaluating test split…")
-    tst_preds, tst_tgts = predict_split(model, test_loader, thr)
-    tst_metrics         = compute_metrics(tst_preds, tst_tgts, thr)
-    print(f"  F1={tst_metrics['f1']:.4f}  IoU={tst_metrics['iou']:.4f}  "
-          f"Prec={tst_metrics['precision']:.4f}  Rec={tst_metrics['recall']:.4f}")
+        model     = get_model()
+        raw_model = getattr(model, '_orig_mod', model)
+        raw_model.load_state_dict(ckpt['model_state_dict'])
+        model.eval()
 
-    # ── Table + plots ────────────────────────────────────────────────────────
-    print_results_table(val_metrics, tst_metrics)
+        current_size = test_dataset.transform.transforms[0].height
+        if CONFIG['image_size'] != current_size:
+            print(f"Recreating test_loader for image_size {CONFIG['image_size']}")
+            test_dataset = ChangeDetectionDataset(
+                root_dir=dataset_root, split='test',
+                norm_stats=norm_stats,
+                image_size=CONFIG['image_size'], is_train=False
+            )
+            _kw = dict(
+                batch_size=CONFIG['batch_size'],
+                num_workers=CONFIG['num_workers'],
+                pin_memory=True,
+                persistent_workers=True,
+                prefetch_factor=4,
+            )
+            test_loader = DataLoader(test_dataset, shuffle=False, **_kw)
+            print(f"Test batches : {len(test_loader)}")
 
-    plot_confusion_matrix(val_preds, val_tgts, thr, 'val',  out_dir)
-    plot_confusion_matrix(tst_preds, tst_tgts, thr, 'test', out_dir)
+        test_loss, test_metrics, test_cm = test_model(model, test_loader)
 
-    visualize_predictions(model, val_loader,  'val',  thr, out_dir)
-    visualize_predictions(model, test_loader, 'test', thr, out_dir)
+        print(f"\nEvaluating: {i}")
+        print(f"Test Loss:      {test_loss:.4f}")
+        print(f"Test F1:        {test_metrics['f1']:.4f}")
+        print(f"Test IoU:       {test_metrics['iou']:.4f}")
+        print(f"Test Precision: {test_metrics['precision']:.4f}")
+        print(f"Test Recall:    {test_metrics['recall']:.4f}")
 
-    # ── Save JSON results ────────────────────────────────────────────────────
-    results = {
-        'threshold':  thr,
-        'validation': {k: round(v, 4) for k, v in val_metrics.items()},
-        'test':       {k: round(v, 4) for k, v in tst_metrics.items()},
-    }
-    json_path = os.path.join(out_dir, 'results.json')
-    with open(json_path, 'w') as f:
-        json.dump(results, f, indent=2)
-    print(f"\n[eval] Results saved → {json_path}")
-    print(json.dumps(results, indent=2))
+        run_results_dir = os.path.join(dataset_root, i, 'test_results')
+        os.makedirs(run_results_dir, exist_ok=True)
 
-    return results
+        test_results_path = os.path.join(run_results_dir, 'test_metrics.json')
+        with open(test_results_path, 'w') as f:
+            json.dump({
+                'test_loss': test_loss,
+                'metrics':   {k: v for k, v in test_metrics.items()},
+                'confusion_matrix': test_cm.tolist()
+            }, f, indent=4)
+        print(f"Test results saved to: {test_results_path}")
+
+        plot_test_confusion_matrix(test_cm, i, run_results_dir)
+
+        CONFIG['encoder']     = original_encoder
+        CONFIG['image_size']  = original_image_size
+        CONFIG['batch_size']  = original_batch_size

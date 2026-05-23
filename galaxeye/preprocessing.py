@@ -1,394 +1,422 @@
-"""
-preprocessing.py
-----------------
-All dataset preparation steps that run *once* before training:
-
-    1. re_label_targets   - remap class 0/1 → 0, class 2/3 → 1
-    2. compute_diffs      - per-pixel |EO_gray - SAR| for every split
-    3. find_valid_files   - list training tiles that have at least one
-                            changed pixel (skip all-background tiles)
-    4. compute_norm_stats - per-channel mean/std over the training set
-    5. compute_pos_weight - negative / positive pixel ratio for BCE
-    6. check_corrupted    - verify every file in each split is readable
-    7. run_all            - convenience wrapper that runs 1-6 in order
-
-Usage
------
-    from galaxeye.preprocessing import run_all
-    run_all('/path/to/dataset_root')
-"""
-
+import zipfile
 import os
+import rasterio
+import numpy as np
 import json
 import warnings
-import numpy as np
-import rasterio
 from rasterio.errors import NotGeoreferencedWarning
 
 warnings.filterwarnings('ignore', category=NotGeoreferencedWarning)
 
-# ── Label remapping ────────────────────────────────────────────────────────
+from .config import CONFIG
 
-_LABEL_MAP = {0: 0, 1: 0, 2: 1, 3: 1}
+dataset_root = CONFIG['dataset_root']
+train = dataset_root + "/train/"
+test  = dataset_root + "/test/"
+val   = dataset_root + "/val/"
 
 
-def re_label_targets(dataset_root: str, splits=('train', 'val', 'test')) -> None:
-    """
-    Read raw target TIFFs (values 0-3) and write binary masks (0/1) to
-    <split>/re_labelled-target/.
+def extract(zfile_path, destination_folder=None):
+    if destination_folder is None:
+        destination_folder = dataset_root
+    os.makedirs(destination_folder, exist_ok=True)
+    try:
+        with zipfile.ZipFile(zfile_path, 'r') as zip_ref:
+            zip_ref.extractall(destination_folder)
+        print(f"Successfully extracted '{zfile_path}' to '{destination_folder}'")
+    except FileNotFoundError:
+        print(f"Error: The file '{zfile_path}' was not found.")
+    except zipfile.BadZipFile:
+        print(f"Error: '{zfile_path}' is not a valid zip file.")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
 
-    Args:
-        dataset_root: Root directory that contains train/, val/, test/.
-        splits:       Which splits to process.
-    """
-    for split in splits:
-        src_dir = os.path.join(dataset_root, split, 'target')
-        dst_dir = os.path.join(dataset_root, split, 're_labelled-target')
-        os.makedirs(dst_dir, exist_ok=True)
 
-        if not os.path.isdir(src_dir):
-            print(f"[re_label] Skipping {split} - target dir not found: {src_dir}")
-            continue
+def re_labeling(target_input_directory):
+    label_map = {0: 0, 1: 0, 2: 1, 3: 1}
 
-        files = [f for f in os.listdir(src_dir) if f.endswith(('.tif', '.tiff'))]
-        print(f"[re_label] {split}: processing {len(files)} files → {dst_dir}")
+    parent_directory = os.path.dirname(target_input_directory)
+    re_labelled_output_directory = os.path.join(parent_directory, 're_labelled-target')
 
-        for filename in files:
-            dst_path = os.path.join(dst_dir, filename)
-            if os.path.exists(dst_path):
-                continue  # already done
+    os.makedirs(re_labelled_output_directory, exist_ok=True)
+    print(f"Re-labeled images will be saved to: {re_labelled_output_directory}")
 
-            src_path = os.path.join(src_dir, filename)
+    for filename in os.listdir(target_input_directory):
+        if filename.endswith(('.tif', '.tiff')):
+            input_filepath  = os.path.join(target_input_directory, filename)
+            output_filepath = os.path.join(re_labelled_output_directory, filename)
             try:
-                with rasterio.open(src_path) as src:
-                    arr = src.read(1)
-                    profile = src.profile.copy()
+                with rasterio.open(input_filepath) as src:
+                    img_array = src.read(1)
+                    profile   = src.profile.copy()
 
-                relabelled = np.vectorize(_LABEL_MAP.get)(arr).astype(np.uint8)
-                profile.update(dtype=rasterio.uint8, TILED=True,
-                                blockxsize=1024, blockysize=1024)
+                    re_labeled_array = np.vectorize(label_map.get)(img_array)
 
-                tmp = dst_path + '.tmp'
-                with rasterio.open(tmp, 'w', **profile) as dst:
-                    dst.write(relabelled, 1)
-                os.rename(tmp, dst_path)
+                    profile.update(dtype=rasterio.uint8, TILED=True,
+                                   blockxsize=1024, blockysize=1024)
 
+                    with rasterio.open(output_filepath, 'w', **profile) as dst:
+                        dst.write(re_labeled_array.astype(rasterio.uint8), 1)
+                print(f"Successfully re-labeled and saved: {filename} to {re_labelled_output_directory}")
+
+            except rasterio.errors.RasterioIOError as e:
+                print(f"Error: Rasterio encountered an issue with {filename}: {e}")
+            except FileNotFoundError:
+                print(f"Error: File not found: {input_filepath}")
             except Exception as e:
-                print(f"  [re_label] ERROR {filename}: {e}")
-
-        print(f"[re_label] {split}: done.")
+                print(f"An error occurred while processing {filename}: {e}")
 
 
-# ── Difference images ──────────────────────────────────────────────────────
+def print_unique_tif_values(tif_image_path):
+    try:
+        with rasterio.open(tif_image_path) as src:
+            img_array    = src.read(1)
+            unique_values = np.unique(img_array)
+            print(f"Unique values in {tif_image_path.split('/')[-1]}: {unique_values}")
+    except FileNotFoundError:
+        print(f"Error: File not found: {tif_image_path.split('/')[-1]}")
+    except Exception as e:
+        print(f"An error occurred while processing {tif_image_path.split('/')[-1]}: {e}")
 
-def compute_diffs(dataset_root: str, splits=('train', 'val', 'test')) -> None:
-    """
-    Compute and save |EO_gray - SAR_norm| per tile for each split.
-    Output is a single-band float32 GeoTIFF in <split>/diff/.
 
-    Args:
-        dataset_root: Root directory containing the splits.
-        splits:       Which splits to process.
-    """
-    for split in splits:
-        eo_dir   = os.path.join(dataset_root, split, 'pre-event')
-        sar_dir  = os.path.join(dataset_root, split, 'post-event')
-        diff_dir = os.path.join(dataset_root, split, 'diff')
-        os.makedirs(diff_dir, exist_ok=True)
+def inspect_image_metadata(image_path, image_type):
+    try:
+        with rasterio.open(image_path) as src:
+            print(f"\n--- {image_type} Image: {image_path.split('/')[-1]} ---")
+            print(f"  Dimensions: {src.width}x{src.height}")
+            print(f"  Number of bands: {src.count}")
+            print(f"  Data type: {src.dtypes[0]}")
+    except FileNotFoundError:
+        print(f"Error: File not found: {image_path}")
+    except Exception as e:
+        print(f"An error occurred while inspecting {image_path}: {e}")
 
-        if not os.path.isdir(eo_dir):
-            print(f"[diff] Skipping {split} - pre-event dir not found.")
+
+def calculate_change_percentage(mask_path):
+    try:
+        with rasterio.open(mask_path) as src:
+            mask_array     = src.read(1)
+            total_pixels   = mask_array.size
+            changed_pixels = np.sum(mask_array == 1)
+            if total_pixels == 0:
+                return 0.0
+            return (changed_pixels / total_pixels) * 100
+    except Exception as e:
+        print(f"Error processing {mask_path.split('/')[-1]}: {e}")
+        return None
+
+
+def check_dim_img(train_dir=None):
+    t = train_dir or train
+    sizes = set()
+    for f in os.listdir(t + "pre-event/")[:50]:
+        with rasterio.open(t + "pre-event/" + f) as src:
+            sizes.add((src.width, src.height))
+    print("Unique sizes:", sizes)
+
+
+def valid__files(train_dir=None, root=None):
+    t = train_dir or train
+    r = root      or dataset_root
+    valid_files = []
+    for f in os.listdir(f'{t}/target/'):
+        with rasterio.open(f'{t}/target/{f}') as src:
+            mask = src.read(1)
+            if mask.sum() > 0:
+                valid_files.append(f)
+
+    print(f"Total train files: {len(os.listdir(f'{t}/target/'))}")
+    print(f"Valid (non-empty) files: {len(valid_files)}")
+
+    with open(r + 'valid_train_files.txt', 'w') as f:
+        f.write('\n'.join(valid_files))
+
+
+def compute_and_save_diff(split_path):
+    eo_dir   = os.path.join(split_path, 'pre-event/')
+    sar_dir  = os.path.join(split_path, 'post-event/')
+    diff_dir = os.path.join(split_path, 'diff/')
+    os.makedirs(diff_dir, exist_ok=True)
+
+    print(f"Computing and saving diff images for {split_path.split('/')[-2]} split...")
+
+    for fname in os.listdir(eo_dir):
+        if not fname.endswith(('.tif', '.tiff')):
             continue
 
-        files = [f for f in os.listdir(eo_dir) if f.endswith(('.tif', '.tiff'))]
-        print(f"[diff] {split}: computing {len(files)} difference images…")
+        eo_file_path   = os.path.join(eo_dir,   fname)
+        sar_file_path  = os.path.join(sar_dir,  fname)
+        diff_file_path = os.path.join(diff_dir, fname)
 
-        for fname in files:
-            dst_path = os.path.join(diff_dir, fname)
-            if os.path.exists(dst_path):
+        if os.path.exists(diff_file_path):
+            print(f"Skipping {fname}: Difference file already exists.")
+            continue
+
+        try:
+            with rasterio.open(eo_file_path) as src_eo:
+                eo      = src_eo.read().astype(np.float32)
+                eo      = eo / (255.0 if eo.max() > 1 else 1.0)
+                profile = src_eo.profile.copy()
+
+            with rasterio.open(sar_file_path) as src_sar:
+                sar = src_sar.read(1).astype(np.float32)
+                sar = sar / (sar.max() + 1e-8) if sar.max() > 0 else sar
+
+            if eo.shape[0] >= 3:
+                eo_gray = 0.299 * eo[0] + 0.587 * eo[1] + 0.114 * eo[2]
+            elif eo.shape[0] == 1:
+                eo_gray = eo[0]
+            else:
+                print(f"Warning: Unexpected number of channels for EO image {fname}. Skipping.")
                 continue
 
-            try:
-                with rasterio.open(os.path.join(eo_dir, fname)) as src:
-                    eo      = src.read().astype(np.float32)
-                    profile = src.profile.copy()
-                eo = eo / (255.0 if eo.max() > 1 else 1.0)
+            diff = np.abs(eo_gray - sar)
 
-                with rasterio.open(os.path.join(sar_dir, fname)) as src:
-                    sar = src.read(1).astype(np.float32)
-                sar_max = sar.max()
-                sar = sar / (sar_max + 1e-8) if sar_max > 0 else sar
+            profile.update(
+                driver='GTiff', count=1, dtype=rasterio.float32,
+                compress='lzw', TILED=True, blockxsize=1024, blockysize=1024
+            )
 
-                if eo.shape[0] >= 3:
-                    eo_gray = 0.299 * eo[0] + 0.587 * eo[1] + 0.114 * eo[2]
-                else:
-                    eo_gray = eo[0]
+            temp_diff_file_path = diff_file_path + ".tmp"
+            with rasterio.open(temp_diff_file_path, 'w', **profile) as dst:
+                dst.write(diff[np.newaxis, :, :])
+            os.rename(temp_diff_file_path, diff_file_path)
+            print(f"Successfully computed and saved: {fname} to {diff_file_path}")
 
-                diff = np.abs(eo_gray - sar)
-
-                profile.update(driver='GTiff', count=1, dtype=rasterio.float32,
-                                compress='lzw', TILED=True,
-                                blockxsize=1024, blockysize=1024)
-
-                tmp = dst_path + '.tmp'
-                with rasterio.open(tmp, 'w', **profile) as dst:
-                    dst.write(diff[np.newaxis])
-                os.rename(tmp, dst_path)
-
-            except Exception as e:
-                print(f"  [diff] ERROR {fname}: {e}")
-
-        print(f"[diff] {split}: done.")
-
-
-# ── Valid file list ────────────────────────────────────────────────────────
-
-def find_valid_files(dataset_root: str) -> list:
-    """
-    Return filenames (from train/re_labelled-target/) that have at least
-    one changed pixel, and also pass a read-integrity check across all four
-    modalities (pre, post, diff, re_labelled-target).
-
-    Saves the result to <dataset_root>/valid_train_files.txt.
-
-    Returns:
-        List of valid filenames.
-    """
-    target_dir = os.path.join(dataset_root, 'train', 're_labelled-target')
-    pre_dir    = os.path.join(dataset_root, 'train', 'pre-event')
-    post_dir   = os.path.join(dataset_root, 'train', 'post-event')
-    diff_dir   = os.path.join(dataset_root, 'train', 'diff')
-
-    all_files = [f for f in os.listdir(target_dir)
-                 if f.endswith(('.tif', '.tiff'))]
-
-    print(f"[valid_files] Scanning {len(all_files)} training tiles…")
-    valid = []
-
-    for fname in all_files:
-        try:
-            with rasterio.open(os.path.join(target_dir, fname)) as src:
-                mask = src.read(1)
-            if mask.sum() == 0:
-                continue  # skip background-only tiles
-
-            # Integrity check
-            for path in [
-                os.path.join(pre_dir,    fname),
-                os.path.join(post_dir,   fname),
-                os.path.join(diff_dir,   fname),
-                os.path.join(target_dir, fname),
-            ]:
-                with rasterio.open(path) as src:
-                    src.read(1, window=((0, 1), (0, 1)))  # read 1 pixel
-
-            valid.append(fname)
-
+        except FileNotFoundError:
+            print(f"Error: One of the files for {fname} not found. Skipping.")
         except Exception as e:
-            print(f"  [valid_files] Skipping {fname}: {e}")
-
-    out_path = os.path.join(dataset_root, 'valid_train_files.txt')
-    with open(out_path, 'w') as f:
-        f.write('\n'.join(valid))
-
-    print(f"[valid_files] {len(valid)} / {len(all_files)} tiles are valid "
-          f"→ saved to {out_path}")
-    return valid
+            print(f"An error occurred while processing {fname}: {e}")
 
 
-# ── Normalisation statistics ───────────────────────────────────────────────
+def compute_pos_weight_for_all(train_dir=None, root=None):
+    t = train_dir or train
+    r = root      or dataset_root
+    re_labelled_target_dir  = os.path.join(t, 're_labelled-target')
+    sample_train_filenames  = os.listdir(re_labelled_target_dir)
 
-def compute_norm_stats(dataset_root: str,
-                       valid_files: list = None) -> dict:
-    """
-    Compute per-channel mean and std over the training set using Welford-style
-    online accumulation (memory-efficient).
+    total_positive_pixels = 0
+    total_negative_pixels = 0
 
-    Args:
-        dataset_root: Dataset root directory.
-        valid_files:  List of filenames to use. If None, reads
-                      valid_train_files.txt from dataset_root.
+    print("Calculating pixel counts for pos_weight using all available files...")
 
-    Returns:
-        dict with keys eo_mean, eo_std, sar_mean, sar_std, diff_mean, diff_std.
-        Also saves the result to <dataset_root>/norm_stats.json.
-    """
-    if valid_files is None:
-        txt = os.path.join(dataset_root, 'valid_train_files.txt')
-        with open(txt) as f:
-            valid_files = f.read().splitlines()
-
-    pre_dir  = os.path.join(dataset_root, 'train', 'pre-event')
-    post_dir = os.path.join(dataset_root, 'train', 'post-event')
-    diff_dir = os.path.join(dataset_root, 'train', 'diff')
-
-    eo_sum   = np.zeros(3, dtype=np.float64)
-    eo_sq    = np.zeros(3, dtype=np.float64)
-    sar_sum  = sar_sq = diff_sum = diff_sq = 0.0
-    n = 0
-
-    print(f"[norm_stats] Computing stats over {len(valid_files)} tiles…")
-    for i, fname in enumerate(valid_files):
+    for i, filename in enumerate(sample_train_filenames):
+        mask_path = os.path.join(re_labelled_target_dir, filename)
         try:
-            with rasterio.open(os.path.join(pre_dir, fname)) as src:
-                eo = src.read().astype(np.float32) / 255.0   # (3, H, W)
-            with rasterio.open(os.path.join(post_dir, fname)) as src:
-                sar = src.read(1).astype(np.float32) / 255.0
-            with rasterio.open(os.path.join(diff_dir, fname)) as src:
-                diff = src.read(1).astype(np.float32)
-
-            eo_sum  += eo.mean(axis=(1, 2))
-            eo_sq   += (eo ** 2).mean(axis=(1, 2))
-            sar_sum += sar.mean();   sar_sq  += (sar  ** 2).mean()
-            diff_sum += diff.mean(); diff_sq += (diff ** 2).mean()
-            n += 1
-
+            with rasterio.open(mask_path) as src:
+                mask_array = src.read(1).astype(np.uint8)
+                total_positive_pixels += np.sum(mask_array == 1)
+                total_negative_pixels += np.sum(mask_array == 0)
         except Exception as e:
-            print(f"  [norm_stats] Skipping {fname}: {e}")
-
+            print(f"Error processing {filename} for pos_weight calculation: {e}")
         if i % 200 == 0:
-            print(f"  {i}/{len(valid_files)}", end='\r')
+            print(i)
 
-    eo_mean = eo_sum / n
-    eo_std  = np.sqrt(np.maximum(eo_sq / n - eo_mean ** 2, 0))
+    if total_positive_pixels == 0:
+        print("Warning: No positive pixels found. pos_weight will be set to 1.")
+        pos_weight_value_for_all = 1.0
+    else:
+        pos_weight_value_for_all = total_negative_pixels / total_positive_pixels
+
+    print(f"Total Positive Pixels: {total_positive_pixels}")
+    print(f"Total Negative Pixels: {total_negative_pixels}")
+    print(f"Calculated pos_weight: {pos_weight_value_for_all:.2f}")
+    with open(r + 'pos_weight_for_all.txt', 'w') as f:
+        f.write(str(pos_weight_value_for_all))
+
+
+def compute_pos_weight_for_valid(train_dir=None, root=None):
+    t = train_dir or train
+    r = root      or dataset_root
+    re_labelled_target_dir = os.path.join(t, 're_labelled-target')
+    with open(r + 'valid_train_files.txt', 'r') as f:
+        sample_train_filenames = f.read().split()
+
+    total_positive_pixels = 0
+    total_negative_pixels = 0
+
+    print("Calculating pixel counts for pos_weight using valid files...")
+
+    for i, filename in enumerate(sample_train_filenames):
+        mask_path = os.path.join(re_labelled_target_dir, filename)
+        try:
+            with rasterio.open(mask_path) as src:
+                mask_array = src.read(1).astype(np.uint8)
+                total_positive_pixels += np.sum(mask_array == 1)
+                total_negative_pixels += np.sum(mask_array == 0)
+        except Exception as e:
+            print(f"Error processing {filename} for pos_weight calculation: {e}")
+        if i % 200 == 0:
+            print(i)
+
+    if total_positive_pixels == 0:
+        print("Warning: No positive pixels found. pos_weight will be set to 1.")
+        pos_weight_value_for_valid = 1.0
+    else:
+        pos_weight_value_for_valid = total_negative_pixels / total_positive_pixels
+
+    print(f"Total Positive Pixels: {total_positive_pixels}")
+    print(f"Total Negative Pixels: {total_negative_pixels}")
+    print(f"Calculated pos_weight: {pos_weight_value_for_valid:.2f}")
+    with open(r + 'pos_weight_for_valid.txt', 'w') as f:
+        f.write(str(pos_weight_value_for_valid))
+
+
+def check_corrupted_files(root_dir, split, include_diff=True):
+    print(f"\n--- Checking for corrupted files in {split} split ---")
+
+    pre_event_dir  = os.path.join(root_dir, split, 'pre-event')
+    post_event_dir = os.path.join(root_dir, split, 'post-event')
+    target_dir     = os.path.join(root_dir, split, 're_labelled-target')
+    diff_dir       = os.path.join(root_dir, split, 'diff')
+
+    directories_to_check = {
+        'pre-event':          pre_event_dir,
+        'post-event':         post_event_dir,
+        're_labelled-target': target_dir
+    }
+    if include_diff:
+        directories_to_check['diff'] = diff_dir
+
+    corrupted_files_found = 0
+
+    for dir_name, path in directories_to_check.items():
+        if not os.path.exists(path):
+            print(f"Warning: Directory '{path}' not found. Skipping {dir_name} check.")
+            continue
+
+        print(f"Checking {dir_name} directory...")
+        for filename in os.listdir(path):
+            if filename.endswith(('.tif', '.tiff')):
+                filepath = os.path.join(path, filename)
+                try:
+                    with rasterio.open(filepath) as src:
+                        _ = src.read(1, window=((0, 1), (0, 1)))
+                except rasterio.errors.RasterioIOError as e:
+                    print(f"  Corrupted file found in {dir_name}: {filename} - Error: {e}")
+                    corrupted_files_found += 1
+                except Exception as e:
+                    print(f"  Unexpected error with file in {dir_name}: {filename} - Error: {e}")
+                    corrupted_files_found += 1
+
+    if corrupted_files_found == 0:
+        print(f"No corrupted files found in {split} split.")
+    else:
+        print(f"Total corrupted files found in {split} split: {corrupted_files_found}")
+
+
+def filter_corrupted_valid_files(root=None):
+    """Re-check valid_train_files.txt and remove any that can't be fully read."""
+    r = root or dataset_root
+    valid_files = open(r + '/valid_train_files.txt').read().splitlines()
+
+    corrupted = []
+    clean     = []
+
+    for fname in valid_files:
+        try:
+            with rasterio.open(f'{r}/train/pre-event/{fname}')         as src: src.read(1)
+            with rasterio.open(f'{r}/train/post-event/{fname}')        as src: src.read(1)
+            with rasterio.open(f'{r}/train/diff/{fname}')              as src: src.read(1)
+            with rasterio.open(f'{r}/train/re_labelled-target/{fname}') as src: src.read(1)
+            clean.append(fname)
+        except Exception as e:
+            corrupted.append(fname)
+            print(f"Corrupted: {fname} — {e}")
+
+    print(f"\nTotal valid files: {len(valid_files)}")
+    print(f"Corrupted: {len(corrupted)}")
+    print(f"Clean: {len(clean)}")
+
+    with open(r + '/valid_train_files.txt', 'w') as f:
+        f.write('\n'.join(clean))
+    print("Updated valid_train_files.txt")
+
+
+def compute_norm_stats(root=None):
+    """Compute mean/std for EO, SAR, diff over valid training files."""
+    r = root or dataset_root
+    valid_files = open(os.path.join(r, 'valid_train_files.txt')).read().splitlines()
+
+    eo_sum     = np.zeros(3)
+    eo_sq_sum  = np.zeros(3)
+    sar_sum    = sar_sq_sum = diff_sum = diff_sq_sum = 0.0
+    count      = 0
+
+    for i, fname in enumerate(valid_files):
+        with rasterio.open(f'{r}/train/pre-event/{fname}') as src:
+            eo = src.read().astype(np.float32) / 255.0
+        with rasterio.open(f'{r}/train/post-event/{fname}') as src:
+            sar = src.read(1).astype(np.float32) / 255.0
+        with rasterio.open(f'{r}/train/diff/{fname}') as src:
+            diff = src.read(1).astype(np.float32)
+
+        eo_sum    += eo.mean(axis=(1, 2))
+        eo_sq_sum += (eo ** 2).mean(axis=(1, 2))
+        sar_sum   += sar.mean()
+        sar_sq_sum += (sar ** 2).mean()
+        diff_sum  += diff.mean()
+        diff_sq_sum += (diff ** 2).mean()
+        count += 1
+        if i % 200 == 0:
+            print(i)
+
+    n        = count
+    eo_mean  = eo_sum  / n
+    eo_std   = np.sqrt(eo_sq_sum  / n - eo_mean ** 2)
+    sar_mean = sar_sum / n
+    sar_std  = np.sqrt(sar_sq_sum / n - sar_mean ** 2)
+    diff_mean = diff_sum / n
+    diff_std  = np.sqrt(diff_sq_sum / n - diff_mean ** 2)
 
     stats = {
         'eo_mean':   eo_mean.tolist(),
         'eo_std':    eo_std.tolist(),
-        'sar_mean':  float(sar_sum / n),
-        'sar_std':   float(np.sqrt(max(sar_sq / n - (sar_sum / n) ** 2, 0))),
-        'diff_mean': float(diff_sum / n),
-        'diff_std':  float(np.sqrt(max(diff_sq / n - (diff_sum / n) ** 2, 0))),
+        'sar_mean':  float(sar_mean),
+        'sar_std':   float(sar_std),
+        'diff_mean': float(diff_mean),
+        'diff_std':  float(diff_std),
     }
 
-    out_path = os.path.join(dataset_root, 'norm_stats.json')
-    with open(out_path, 'w') as f:
+    with open(os.path.join(r, 'norm_stats.json'), 'w') as f:
         json.dump(stats, f, indent=2)
 
-    print(f"\n[norm_stats] Done (n={n}). Saved → {out_path}")
     print(json.dumps(stats, indent=2))
+    print(f"\nComputed from {count} valid training files")
     return stats
 
 
-# ── Positive weight ────────────────────────────────────────────────────────
+def run_all(root=None):
+    """Run the full preprocessing pipeline in the exact order of the notebook."""
+    r    = root or dataset_root
+    tr   = r + "/train/"
+    te   = r + "/test/"
+    va   = r + "/val/"
 
-def compute_pos_weight(dataset_root: str, valid_files: list = None) -> float:
-    """
-    Compute neg_pixels / pos_pixels across re_labelled-target masks for the
-    pos_weight argument of BCEWithLogitsLoss.
+    # 1. Re-label
+    re_labeling(tr + 'target')
+    re_labeling(te + 'target')
+    re_labeling(va + 'target')
 
-    Args:
-        dataset_root: Dataset root directory.
-        valid_files:  Filenames to include. If None, reads
-                      valid_train_files.txt.
+    # 2. Compute diffs
+    for split_path in [tr, va, te]:
+        compute_and_save_diff(split_path)
 
-    Returns:
-        pos_weight value (float). Also saved to pos_weight.txt.
-    """
-    if valid_files is None:
-        txt = os.path.join(dataset_root, 'valid_train_files.txt')
-        with open(txt) as f:
-            valid_files = f.read().splitlines()
+    # 3. Find valid files
+    valid__files(tr, r + '/')
 
-    target_dir = os.path.join(dataset_root, 'train', 're_labelled-target')
-    pos = neg = 0
+    # 4. Filter corrupted
+    filter_corrupted_valid_files(r)
 
-    print(f"[pos_weight] Scanning {len(valid_files)} masks…")
-    for i, fname in enumerate(valid_files):
-        try:
-            with rasterio.open(os.path.join(target_dir, fname)) as src:
-                mask = src.read(1).astype(np.uint8)
-            pos += int(np.sum(mask == 1))
-            neg += int(np.sum(mask == 0))
-        except Exception as e:
-            print(f"  Skipping {fname}: {e}")
-        if i % 200 == 0:
-            print(f"  {i}/{len(valid_files)}", end='\r')
+    # 5. Norm stats
+    compute_norm_stats(r)
 
-    w = neg / pos if pos > 0 else 1.0
-    print(f"\n[pos_weight] pos={pos:,}  neg={neg:,}  weight={w:.2f}")
+    # 6. Pos weight
+    compute_pos_weight_for_valid(tr, r + '/')
 
-    with open(os.path.join(dataset_root, 'pos_weight.txt'), 'w') as f:
-        f.write(str(w))
-
-    return w
-
-
-# ── Integrity check ────────────────────────────────────────────────────────
-
-def check_corrupted(dataset_root: str,
-                    splits=('train', 'val', 'test')) -> dict:
-    """
-    Try to open and read 1 pixel from every TIFF in pre-event, post-event,
-    re_labelled-target, and diff for each split.
-
-    Returns:
-        Dict mapping split → list of corrupted filenames.
-    """
-    results = {}
-    dirs_to_check = ['pre-event', 'post-event', 're_labelled-target', 'diff']
-
-    for split in splits:
-        bad = []
-        print(f"\n[check_corrupted] {split}…")
-        for sub in dirs_to_check:
-            d = os.path.join(dataset_root, split, sub)
-            if not os.path.isdir(d):
-                continue
-            for fname in os.listdir(d):
-                if not fname.endswith(('.tif', '.tiff')):
-                    continue
-                try:
-                    with rasterio.open(os.path.join(d, fname)) as src:
-                        src.read(1, window=((0, 1), (0, 1)))
-                except Exception as e:
-                    bad.append(f"{sub}/{fname}: {e}")
-
-        results[split] = bad
-        if bad:
-            print(f"  ⚠ {len(bad)} corrupted file(s):")
-            for b in bad:
-                print(f"    {b}")
-        else:
-            print(f"  ✓ No corrupted files in {split}.")
-
-    return results
-
-
-# ── One-call convenience ───────────────────────────────────────────────────
-
-def run_all(dataset_root: str, splits=('train', 'val', 'test')) -> dict:
-    """
-    Run the full preprocessing pipeline in order:
-        1. re_label_targets
-        2. compute_diffs
-        3. find_valid_files
-        4. compute_norm_stats
-        5. compute_pos_weight
-        6. check_corrupted
-
-    Args:
-        dataset_root: Root directory of the dataset.
-        splits:       Which splits to preprocess.
-
-    Returns:
-        dict with keys: valid_files, norm_stats, pos_weight.
-    """
-    print("=" * 60)
-    print("GalaxEye Preprocessing Pipeline")
-    print("=" * 60)
-
-    re_label_targets(dataset_root, splits)
-    compute_diffs(dataset_root, splits)
-
-    valid_files = find_valid_files(dataset_root)
-    norm_stats  = compute_norm_stats(dataset_root, valid_files)
-    pos_weight  = compute_pos_weight(dataset_root, valid_files)
-    check_corrupted(dataset_root, splits)
+    # 7. Corruption check
+    check_corrupted_files(r, 'train', include_diff=True)
+    check_corrupted_files(r, 'val',   include_diff=True)
+    check_corrupted_files(r, 'test',  include_diff=True)
 
     print("\n✓ Preprocessing complete.")
-    return {
-        'valid_files': valid_files,
-        'norm_stats':  norm_stats,
-        'pos_weight':  pos_weight,
-    }
