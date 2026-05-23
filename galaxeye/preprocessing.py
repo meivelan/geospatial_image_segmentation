@@ -384,39 +384,3 @@ def compute_norm_stats(root=None):
     print(json.dumps(stats, indent=2))
     print(f"\nComputed from {count} valid training files")
     return stats
-
-
-def run_all(root=None):
-    """Run the full preprocessing pipeline in the exact order of the notebook."""
-    r    = root or dataset_root
-    tr   = r + "/train/"
-    te   = r + "/test/"
-    va   = r + "/val/"
-
-    # 1. Re-label
-    re_labeling(tr + 'target')
-    re_labeling(te + 'target')
-    re_labeling(va + 'target')
-
-    # 2. Compute diffs
-    for split_path in [tr, va, te]:
-        compute_and_save_diff(split_path)
-
-    # 3. Find valid files
-    valid__files(tr, r + '/')
-
-    # 4. Filter corrupted
-    filter_corrupted_valid_files(r)
-
-    # 5. Norm stats
-    compute_norm_stats(r)
-
-    # 6. Pos weight
-    compute_pos_weight_for_valid(tr, r + '/')
-
-    # 7. Corruption check
-    check_corrupted_files(r, 'train', include_diff=True)
-    check_corrupted_files(r, 'val',   include_diff=True)
-    check_corrupted_files(r, 'test',  include_diff=True)
-
-    print("\n✓ Preprocessing complete.")

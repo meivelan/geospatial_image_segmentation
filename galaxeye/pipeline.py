@@ -43,7 +43,7 @@ def run_preprocessing(dataset_root=None):
     check_corrupted_files(r, 'val',   include_diff=True)
     check_corrupted_files(r, 'test',  include_diff=True)
 
-    print("\n✓ Preprocessing complete.")
+    print("\nPreprocessing complete.")
 
 
 def run_training(dataset_root=None):
@@ -101,10 +101,6 @@ def run_evaluation(dataset_root=None, checkpoint_path=None,
 
 def run_on_dataset(dataset_root, checkpoint_path=None,
                    test_data_root=None, num_samples=5):
-    """
-    Interview one-liner: preprocess + evaluate on a blind dataset.
-    Skips training — uses your saved best.pth.
-    """
     run_preprocessing(dataset_root)
     return run_evaluation(
         dataset_root    = dataset_root,

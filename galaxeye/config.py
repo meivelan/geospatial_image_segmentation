@@ -1,8 +1,10 @@
 import os
 from pathlib import Path
+from pprint import pprint
 
 CONFIG = {
-    "dataset_root": Path.cwd(),
+    "dataset_root": '/content/',
+    "checkpoint_dir": None,
     "image_size": 512,
     "batch_size": 8,
     "num_workers": 8,
@@ -21,21 +23,14 @@ CONFIG = {
     "grad_clip": 1.0,
 }
 
-run = len(os.listdir(os.path.join(CONFIG["dataset_root"], "results"))) + 1
-CONFIG["checkpoint_dir"] = os.path.join(
-    CONFIG["dataset_root"],
-    "results",
-    f"checkpoints_{CONFIG['encoder']}_{CONFIG['image_size']}px_bs{CONFIG['batch_size']}_run{run}",
-)
-os.makedirs(CONFIG["checkpoint_dir"], exist_ok=True)
-
-
 def get_config():
+    pprint(CONFIG)
     return CONFIG
 
 
 def set_config(
     dataset_root=None,
+    checkpoint_dir=None,
     image_size=None,
     batch_size=None,
     num_workers=None,
@@ -55,6 +50,15 @@ def set_config(
 ):
     if dataset_root:
         CONFIG['dataset_root'] = dataset_root
+        run = len(os.listdir(os.path.join(CONFIG["dataset_root"], "results"))) + 1
+        CONFIG["checkpoint_dir"] = os.path.join(
+            CONFIG["dataset_root"],
+            "results",
+            f"checkpoints_{CONFIG['encoder']}_{CONFIG['image_size']}px_bs{CONFIG['batch_size']}_run{run}",
+        )
+    os.makedirs(CONFIG["checkpoint_dir"], exist_ok=True)
+    if checkpoint_dir:
+        CONFIG['checkpoint_dir'] = checkpoint_dir
     if image_size:
         CONFIG['image_size'] = image_size
     if batch_size:
