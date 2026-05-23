@@ -50,13 +50,16 @@ def set_config(
 ):
     if dataset_root:
         CONFIG['dataset_root'] = dataset_root
-        run = len(os.listdir(os.path.join(CONFIG["dataset_root"], "results"))) + 1
-        CONFIG["checkpoint_dir"] = os.path.join(
+
+        results_dir = os.path.join(CONFIG["dataset_root"], "results")
+        os.makedirs(results_dir, exist_ok=True)
+        run = len(os.listdir(results_dir)) + 1
+        checkpoint_dir = os.path.join(
             CONFIG["dataset_root"],
             "results",
             f"checkpoints_{CONFIG['encoder']}_{CONFIG['image_size']}px_bs{CONFIG['batch_size']}_run{run}",
         )
-    os.makedirs(CONFIG["checkpoint_dir"], exist_ok=True)
+        CONFIG["checkpoint_dir"] = checkpoint_dir
     if checkpoint_dir:
         CONFIG['checkpoint_dir'] = checkpoint_dir
     if image_size:
