@@ -11,14 +11,14 @@ galaxeye_lib/
 │   ├── config.py          # CONFIG dict – single source of truth
 │   ├── preprocessing.py   # relabelling, diff images, norm stats, pos_weight
 │   ├── dataset.py         # ChangeDetectionDataset + albumentations transforms
-│   ├── model.py           # U-Net factory, losses, metrics
+│   ├── model.py           # U-Net, losses, metrics
 │   ├── train.py           # training loop, early stopping, checkpointing
 │   ├── evaluate.py        # metrics, confusion matrix, qualitative plots
-│   └── pipeline.py        # one-call API  ←  use this in the interview
+│   └── pipeline.py        # one-call API
 └── INTERVIEW_CHEATSHEET.ipynb
 ```
 
-## Interview one-liner
+## one-liner
 
 They give you a blind dataset folder:
 
