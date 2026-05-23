@@ -66,7 +66,9 @@ def run_evaluation(dataset_root=None, checkpoint_path=None,
     with open(root + '/norm_stats.json') as f:
         norm_stats = json.load(f)
 
-    ckpt = torch.load(ckpt_path, map_location='cuda')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    ckpt = torch.load(ckpt_path, map_location=device)
+    
     if 'config' in ckpt:
         CONFIG.update(ckpt['config'])
 
