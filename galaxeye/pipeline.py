@@ -49,6 +49,7 @@ def run_preprocessing(dataset_root=None, test_split=False):
         print("Preprocessing only test split")
     te = r + "/test/"
     re_labeling(te + "target")
+    compute_and_save_diff(te)
 
     check_corrupted_files(r, "test", include_diff=True)
 
